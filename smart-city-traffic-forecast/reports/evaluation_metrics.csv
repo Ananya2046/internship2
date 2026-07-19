@@ -1,5 +1,2 @@
 Junction,Model,MAE,RMSE
-1,Prophet,7.921,10.3512
-2,Prophet,3.5607,4.3874
-3,Prophet,7.7689,12.1462
-4,Prophet,6.1062,7.7836
+1,Prophet,43.242,48.38
