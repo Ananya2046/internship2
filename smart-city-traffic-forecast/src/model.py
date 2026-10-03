@@ -55,7 +55,8 @@ def build_sarima_model(train_series: pd.Series, junction: int,
     Parameters
     ----------
     train_series : pd.Series
-        Training time series (Vehicles).
+        Training time series (Vehicles) — must be a pd.Series with a
+        DatetimeIndex so that SARIMAX can properly extend forecasts.
     junction : int
         Junction number (for logging).
     seasonal_period : int
@@ -68,29 +69,38 @@ def build_sarima_model(train_series: pd.Series, junction: int,
     """
     print(f"\n  [SARIMA] Junction {junction}: Finding optimal parameters...")
 
-    # Use auto_arima on a sample for speed (last 2000 points if available)
-    sample = train_series[-2000:] if len(train_series) > 2000 else train_series
+    # Ensure we have a proper pd.Series (convert numpy arrays if needed)
+    if not isinstance(train_series, pd.Series):
+        train_series = pd.Series(train_series)
 
-    auto_model = pm.auto_arima(
-        sample,
-        seasonal=True,
-        m=seasonal_period,
-        max_p=3, max_q=3,
-        max_P=2, max_Q=2,
-        max_d=2, max_D=1,
-        stepwise=True,
-        suppress_warnings=True,
-        error_action="ignore",
-        trace=False,
-        n_fits=30,
-    )
+    # Use a small sample for fast auto_arima parameter search (last 500 pts)
+    sample = train_series.iloc[-500:] if len(train_series) > 500 else train_series
 
-    order = auto_model.order
-    seasonal_order = auto_model.seasonal_order
+    try:
+        auto_model = pm.auto_arima(
+            sample,
+            seasonal=True,
+            m=seasonal_period,
+            max_p=2, max_q=2,       # reduced from 3
+            max_P=1, max_Q=1,       # reduced from 2
+            max_d=1, max_D=1,
+            stepwise=True,
+            suppress_warnings=True,
+            error_action="ignore",
+            trace=False,
+            n_fits=10,              # reduced from 30
+        )
+        order = auto_model.order
+        seasonal_order = auto_model.seasonal_order
+    except Exception:
+        # Fallback to a sensible default if auto_arima fails
+        order = (1, 1, 1)
+        seasonal_order = (1, 0, 0, seasonal_period)
+
     print(f"  [SARIMA] Junction {junction}: Best order={order}, seasonal_order={seasonal_order}")
 
-    # Fit SARIMAX on the full training data (use last 4000 points for tractability)
-    fit_series = train_series[-4000:] if len(train_series) > 4000 else train_series
+    # Fit SARIMAX on last 2000 points for tractability
+    fit_series = train_series.iloc[-2000:] if len(train_series) > 2000 else train_series
 
     model = SARIMAX(
         fit_series,
@@ -100,7 +110,7 @@ def build_sarima_model(train_series: pd.Series, junction: int,
         enforce_invertibility=False,
     )
 
-    fitted_model = model.fit(disp=False, maxiter=200)
+    fitted_model = model.fit(disp=False, maxiter=100)
     print(f"  [SARIMA] Junction {junction}: AIC={fitted_model.aic:.2f}")
 
     return {
@@ -108,6 +118,7 @@ def build_sarima_model(train_series: pd.Series, junction: int,
         "order": order,
         "seasonal_order": seasonal_order,
         "aic": fitted_model.aic,
+        "n_train": len(fit_series),
     }
 
 
@@ -130,7 +141,10 @@ def forecast_sarima(model_result: dict, steps: int) -> np.ndarray:
     forecast = model_result["model"].forecast(steps=steps)
     # Ensure non-negative forecasts
     forecast = np.maximum(forecast, 0)
-    return forecast.values
+    # Handle both pd.Series and np.ndarray outputs
+    if isinstance(forecast, pd.Series):
+        return forecast.values
+    return np.asarray(forecast)
 
 
 def build_prophet_model(train_df: pd.DataFrame, junction: int) -> object:
@@ -233,7 +247,10 @@ def train_all_junctions(df: pd.DataFrame, test_days: int = 30,
 
         # ── SARIMA ──
         try:
-            sarima_result = build_sarima_model(train["Vehicles"].values, junction)
+            # Pass a pd.Series with DatetimeIndex so SARIMAX can extend
+            # forecasts properly (using numpy array loses the time index).
+            train_series = train.set_index("DateTime")["Vehicles"]
+            sarima_result = build_sarima_model(train_series, junction)
             sarima_forecast = forecast_sarima(sarima_result, steps=len(test))
             junction_result["sarima"] = {
                 "model": sarima_result,
@@ -242,6 +259,8 @@ def train_all_junctions(df: pd.DataFrame, test_days: int = 30,
             }
         except Exception as e:
             print(f"  [SARIMA] Junction {junction}: FAILED — {e}")
+            import traceback
+            traceback.print_exc()
             junction_result["sarima"] = None
 
         # ── Prophet ──
